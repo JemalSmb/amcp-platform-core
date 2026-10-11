@@ -1,0 +1,3 @@
+api.jemalsamba.online {
+	reverse_proxy gateway:8080
+}

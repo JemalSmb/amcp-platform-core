@@ -1,0 +1,258 @@
+
+# AMCP Platform — root docker-compose.yml
+# Single entrypoint that brings up the whole platform with:
+#
+#   docker compose up -d
+#
+# from this directory. No other compose files need to be passed on the
+# command line — the sub-project compose files under amcp-ai-engine/ and
+# amcp-services/ are pulled in below via `include:` (Compose v2).
+#
+# -----------------------------------------------------------------------------
+# Network reconciliation
+# -----------------------------------------------------------------------------
+# amcp-services/docker-compose.services.yaml and
+# amcp-ai-engine/ai/inference/docker-compose.inference.yaml were originally
+# written to be run alongside a separate "platform-core" compose file, and
+# both declared `platform-network` as `external: true` (i.e. "some other
+# compose file already created this network"). Since this root file is now
+# the single source of truth and creates that network itself, those two
+# files have been edited to drop `external: true` (see the comments in each
+# file) so Compose's config-merging doesn't hit a redeclaration conflict.
+# The one real definition of `platform-network` lives here, at the bottom
+# of this file.
+#
+# -----------------------------------------------------------------------------
+# Startup order
+# -----------------------------------------------------------------------------
+#   1. postgres, nats   -- core infra, have healthchecks
+#   2. mlflow           -- waits on postgres (healthy) for its backend store
+#   3. inference        -- waits on nats (healthy) and mlflow (started);
+#                          degrades gracefully to local-file/mock scoring if
+#                          MLflow or NATS aren't reachable (see registry.py)
+#   4. domain services  -- threat-detection, phishing-detector, fraud-detector,
+#                          process-anomaly-detector -- wait on nats + inference
+#   5. gateway          -- aggregates the 4 domain services + inference,
+#                          waits on all of them
+#   6. web-client       -- Angular dashboard, talks to the gateway at
+#                          http://localhost:8080 (see src/app/core/config.ts)
+#
+# -----------------------------------------------------------------------------
+# What's NOT pre-existing
+# -----------------------------------------------------------------------------
+# No "amcp-platform-core" compose file exists anywhere in this repo (checked
+# via `find . -iname docker-compose*.y*ml` and a search for
+# "amcp-platform-core") despite being referenced in comments inside the two
+# included files. NATS, Postgres and MLflow are therefore defined directly
+# below. MLflow has no official image, so it's built inline from
+# python:3.11-slim with `pip install mlflow` and pointed at Postgres as its
+# backend store + a local volume for artifacts.
+#
+# amcp-ai-engine/ai/inference/registry.py defaults MLFLOW_TRACKING_URI to a
+# local sqlite file (`sqlite:///.../mlflow.db`) and only ever *reads* from
+# the registry (falls back to a local joblib file, then to deterministic
+# mock scoring, if MLflow is unreachable) -- so the platform runs fine
+# without MLflow. It's still included here (pointed at via
+# MLFLOW_TRACKING_URI=http://mlflow:5000) because the model-serving demo
+# depends on models actually being registered somewhere real, and the
+# training pipelines under amcp-ai-engine/ai/training register models via
+# the mlflow client, which needs a tracking server to register *against*
+# for this to be a genuine registry rather than a per-container sqlite file.
+
+include:
+  - path: ../amcp-ai-engine/ai/inference/docker-compose.inference.yaml
+  - path: ../amcp-services/docker-compose.services.yaml
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core infra
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: platform-postgres
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  nats:
+    image: nats:2-alpine
+    container_name: platform-nats
+    command: ["-js", "-m", "8222"] # enable JetStream, in case any service wants durable streams later
+    ports:
+      # Bound to localhost only -- on a public VM (see Oracle deploy notes
+      # in DEPLOY.md) this should never be reachable from the internet;
+      # only the gateway/domain services (same docker network) need it.
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222" # HTTP monitoring endpoint, also used for the healthcheck
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mlflow:
+    image: python:3.11-slim
+    container_name: platform-mlflow
+    working_dir: /mlflow
+    # NOTE: keep every line at the same indent -- in a YAML folded (>) block,
+    # more-indented lines keep their newlines and the shell would treat each
+    # flag as a separate command.
+    command: >
+      sh -c "pip install --no-cache-dir mlflow==3.11.1 psycopg[binary] &&
+      mlflow server
+      --host 0.0.0.0
+      --allowed-hosts 'mlflow:5000,mlflow,localhost:5000,127.0.0.1:5000'
+      --port 5000
+      --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts"
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    ports:
+      # Localhost only -- SSH-tunnel in to view the UI (ssh -L 5000:localhost:5000 ...)
+      # rather than exposing the tracking server publicly.
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Overrides merged onto the "inference" service defined in
+  # amcp-ai-engine/ai/inference/docker-compose.inference.yaml (pulled in via
+  # `include:` above) -- Compose merges services with the same name across
+  # included/root files, so this just adds env vars + startup deps without
+  # duplicating the build/ports/etc. already declared there.
+  # ---------------------------------------------------------------------------
+  inference:
+    restart: unless-stopped
+    environment:
+      NATS_URL: nats://nats:4222
+      MODEL_POLL_INTERVAL_SECONDS: "20"
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_MODELS_BUCKET: ${SUPABASE_MODELS_BUCKET:-models}
+    depends_on:
+      nats:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    networks:
+      - platform-network
+
+  # ---------------------------------------------------------------------------
+  # Overrides merged onto the 4 domain services + gateway defined in
+  # amcp-services/docker-compose.services.yaml, adding
+  # the service_healthy dependency on nats now that nats is defined here.
+  # ---------------------------------------------------------------------------
+  threat-detection:
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  phishing-detector:
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  fraud-detector:
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  process-anomaly-detector:
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  gateway:
+    restart: unless-stopped
+    depends_on:
+      nats:
+        condition: service_healthy
+      threat-detection:
+        condition: service_started
+      phishing-detector:
+        condition: service_started
+      fraud-detector:
+        condition: service_started
+      process-anomaly-detector:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Angular web dashboard (SSR), served via the Dockerfile added at
+  # amcp-platform-clients/apps/web-client/amcp-web-client/Dockerfile
+  # (multi-stage Node build -> runs the generated Express/SSR server, which
+  # already serves the static browser bundle too, so no nginx is needed).
+  # Talks to the gateway at http://localhost:8080 by default -- see
+  # src/app/core/config.ts in that project.
+  # ---------------------------------------------------------------------------
+  web-client:
+    build:
+      context: ../amcp-platform-clients/apps/web-client/amcp-web-client
+      dockerfile: Dockerfile
+    container_name: platform-web-client
+    environment:
+      PORT: "4000"
+    ports:
+      - "4200:4000"
+    depends_on:
+      gateway:
+        condition: service_started
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Caddy: HTTPS reverse proxy for the gateway (auto Let's Encrypt cert).
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2
+    container_name: platform-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - gateway
+    networks:
+      - platform-network
+    restart: unless-stopped
+
+# -----------------------------------------------------------------------------
+# The one real definition of platform-network. Both included compose files
+# reference `platform-network` under their services but no longer declare it
+# `external`, so this is the definition Compose resolves them against.
+# -----------------------------------------------------------------------------
+networks:
+  platform-network:
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  mlflow-artifacts:
