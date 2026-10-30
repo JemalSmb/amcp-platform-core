@@ -91,3 +91,23 @@ the same docker network, or from the VM itself via SSH tunnel
 Only the gateway (8080) is meant to be public. If you add a new service,
 default its `ports:` entry to `127.0.0.1:<port>:<port>` unless it genuinely
 needs to be internet-facing.
+
+## 7. Help docs (served by the gateway)
+
+The web and desktop "Help and Docs" pages read `GET /help-docs` and
+`GET /help-docs/{id}` from the gateway. The gateway fetches the Markdown from
+the **private** Supabase Storage bucket `client-docs` (folder `help/`) with
+`SUPABASE_SERVICE_ROLE_KEY`, so that key must be set in the VM's `.env`. If it
+is missing the list silently falls back to seeded placeholders and
+`/help-docs/{id}` returns 404.
+
+To publish new or changed docs (run from `amcp-platform-clients`, reads the
+service key from `amcp-core/.env`):
+
+```bash
+node scripts/sync-help-docs-to-supabase.mjs
+```
+
+Optional overrides: `HELP_DOCS_SUPABASE_BUCKET` (default `client-docs`) and
+`HELP_DOCS_SUPABASE_PREFIX` (default `help`).
+
